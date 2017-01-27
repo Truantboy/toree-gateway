@@ -43,7 +43,6 @@ class ToreeGateway(client: SparkKernelClient) {
   private def handleResult(promise:Promise[String], result: ExecuteResult) = {
     log.info(s"Result was: ${result.data(MIMEType.PlainText)}")
     promise.success(result.data(MIMEType.PlainText))
-    //promise.success(result.content)
   }
 
   private def handleSuccess(promise:Promise[String], executeReplyOk: ExecuteReplyOk) = {
@@ -61,7 +60,8 @@ class ToreeGateway(client: SparkKernelClient) {
     promise.success(content.text)
   }
 
-  val ResponseTimeout = 1.seconds
+  val ResponseTimeout = 15.seconds
+  val ErrorResponseTimeout = 15.seconds
   val EvalTimeout = Duration.Inf  // 10.seconds
 
   private def recoverTimeout[A](future: Future[A], timeout: FiniteDuration, default: A): Future[A] = try {
@@ -74,30 +74,33 @@ class ToreeGateway(client: SparkKernelClient) {
   def eval(code: String): Object = {
     val statusPromise = Promise[String]
     val responsePromise = Promise[String]
+    val errorResponsePromise = Promise[String]
     client.execute(code)
       .onResult(executeResult => {
         handleResult(responsePromise, executeResult)
       }).onError(executeReplyError =>{
-      handleError(statusPromise, executeReplyError)
-    }).onStream(streamResult => {
-      handleStream(responsePromise, streamResult)
-    }).onSuccess(executeReplyOk => {
-      handleSuccess(statusPromise, executeReplyOk)
-    })
+        handleError(errorResponsePromise, executeReplyError)
+      }).onStream(streamResult => {
+        handleStream(responsePromise, streamResult)
+      }).onSuccess(executeReplyOk => {
+        handleSuccess(statusPromise, executeReplyOk)
+      })
 
     val successFuture: Future[String] = statusPromise.future
     val responseFuture: Future[String] =
-      recoverTimeout(responsePromise.future, ResponseTimeout, "")
+      recoverTimeout(responsePromise.future, ResponseTimeout, "A timeout happened")
+    val errorResponseFuture: Future[String] =
+      recoverTimeout(errorResponsePromise.future, ErrorResponseTimeout, "A timeout happened")
 
     val aggregateFuture: Future[String] = for (
       success <- successFuture;
-      result <- responseFuture
+      result <- responseFuture;
     ) yield {
       success + result
     }
 
     try {
-      Await.result(aggregateFuture, EvalTimeout)
+      Await.result(Future.firstCompletedOf(Seq(aggregateFuture, errorResponseFuture))  , EvalTimeout)
     } catch {
       case t : Throwable => {
         "Error submitting request: " + t.getMessage
